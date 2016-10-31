@@ -4,3 +4,7 @@ data
 .ipynb_checkpoints
 *.DS_Store
 *.t7
+images/*
+models/trained/*
+run_synthesis.sh
+train_fast.sh
