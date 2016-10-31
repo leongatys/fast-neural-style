@@ -5,6 +5,8 @@ from Queue import Queue
 import numpy as np
 from scipy.misc import imread, imresize
 import h5py
+from skimage.color import rgb2grey
+from skimage import img_as_ubyte
 
 """
 Create an HDF5 file of images for training a feedforward style transfer model.
@@ -20,6 +22,7 @@ parser.add_argument('--max_images', type=int, default=-1)
 parser.add_argument('--num_workers', type=int, default=2)
 parser.add_argument('--include_val', type=int, default=1)
 parser.add_argument('--max_resize', default=16, type=int)
+parser.add_argument('--lum', type=bool, default=False)
 args = parser.parse_args()
 
 
@@ -31,6 +34,8 @@ def add_data(h5_file, image_dir, prefix, args):
     ext = os.path.splitext(filename)[1]
     if ext in image_extensions:
       image_list.append(os.path.join(image_dir, filename))
+  if args.max_images>0:
+    image_list = image_list[:args.max_images]
   num_images = len(image_list)
 
   # Resize all images and copy them into the hdf5 file
@@ -74,6 +79,10 @@ def add_data(h5_file, image_dir, prefix, args):
       elif img.ndim == 2:
         # Grayscale image; it is H x W so broadcasting to C x H x W will just copy
         # grayscale values into all channels.
+        imgs_dset[idx] = img
+      if args.lum:
+        # Make greyscale dataset
+        img = img_as_ubyte(np.tile(rgb2grey(img)[None,:,:],(3,1,1)))
         imgs_dset[idx] = img
       output_queue.task_done()
       num_written = num_written + 1
