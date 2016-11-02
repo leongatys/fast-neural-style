@@ -36,10 +36,16 @@ function StyleLossGuided:updateOutput(input)
        n_masks = masks:size()[2]
     end
     if self.mode == 'capture' then
-        assert(masks:dim() ==3, 'no batches in capture mode')
-        for i = 1, n_masks do
-            self.agg[i] = nn.GramMatrixGuided():type(dtype)
-            self.targets[i] = self.agg[i]:forward({features, masks[i]:repeatTensor(features:size()[1], 1, 1)}):clone()
+        if masks:dim() == 3 then
+            for i = 1, n_masks do
+                self.agg[i] = nn.GramMatrixGuided():type(dtype)
+                self.targets[i] = self.agg[i]:forward({features, masks[{{i},{},{}}]:expandAs(features):contiguous()}):clone()
+            end
+        elseif masks:dim() == 4 then
+            for i = 1, n_masks do
+                self.agg[i] = nn.GramMatrixGuided():type(dtype)
+                self.targets[i] = self.agg[i]:forward({features, masks[{{},{i},{},{}}]:expandAs(features):contiguous()}):clone()
+            end
         end
     elseif self.mode == 'loss' then
         self.loss = 0
