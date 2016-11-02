@@ -28,6 +28,7 @@ end
 
 function StyleLossGuided:updateOutput(input)
     local features, masks = input[1],input[2]
+    assert(features:dim() == masks:dim())
     local n_masks = nil
     local dtype = features:type()
     if masks:dim() == 3 then
@@ -36,17 +37,11 @@ function StyleLossGuided:updateOutput(input)
        n_masks = masks:size()[2]
     end
     if self.mode == 'capture' then
-        if masks:dim() == 3 then
-            for i = 1, n_masks do
-                self.agg[i] = nn.GramMatrixGuided():type(dtype)
-                self.targets[i] = self.agg[i]:forward({features, masks[{{i},{},{}}]:expandAs(features):contiguous()}):clone()
-            end
-        elseif masks:dim() == 4 then
+        assert(masks:dim() == 4, 'style image and mask should have 4 dimensions')
             for i = 1, n_masks do
                 self.agg[i] = nn.GramMatrixGuided():type(dtype)
                 self.targets[i] = self.agg[i]:forward({features, masks[{{},{i},{},{}}]:expandAs(features):contiguous()}):clone()
             end
-        end
     elseif self.mode == 'loss' then
         self.loss = 0
         if masks:dim() == 3 then
@@ -57,7 +52,7 @@ function StyleLossGuided:updateOutput(input)
         elseif masks:dim() == 4 then
             for i = 1, n_masks do
                 local agg_out = self.agg[i]:forward({features, masks[{{},{i},{},{}}]:expandAs(features):contiguous()})
-                self.loss = self.loss + self.strength * self.crit(agg_out, nn.utils.addSingletonDimension(self.targets[i]):expandAs(agg_out):contiguous())
+                self.loss = self.loss + self.strength * self.crit(agg_out, self.targets[i]:expandAs(agg_out):contiguous())
             end
         end
     end
@@ -87,7 +82,7 @@ function StyleLossGuided:updateGradInput(input, gradOutput)
             end
         elseif masks:dim() == 4 then
             for i = 1, n_masks do
-                self.crit:backward(self.agg[i].output, nn.utils.addSingletonDimension(self.targets[i]):expandAs(self.agg[i].output))
+                self.crit:backward(self.agg[i].output, self.targets[i]:expandAs(self.agg[i].output))
                 self.crit.gradInput:mul(self.strength)
                 self.agg[i]:backward({features, masks[{{},{i},{},{}}]:expandAs(features):contiguous()}, self.crit.gradInput)
                 self.gradInput[1]:add(self.agg[i].gradInput)
