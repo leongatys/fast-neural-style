@@ -92,6 +92,7 @@ function crit:__init(args)
                         next_content_ndx = next_content_ndx + 1
                         parallel:add(img_path:clone()):add(guide_path:clone())
                         guided_net:add(parallel:clone())
+                        guided_net.modules[#guided_net].modules[1].modules[1] = layer -- hack to keep contentloss in content_loss_layers table
                         parallel = nn.ParallelTable()
                         img_path = nn.Sequential()
                         guide_path = nn.Sequential()
