@@ -54,9 +54,9 @@ local function build_res_block(dim, padding_type, use_instance_norm)
 end
 
 
-function M.build_model(opt)
+function M.build_model(opt, n_channels)
   local arch = opt.arch:split(',')
-  local prev_dim = 3
+  local prev_dim = n_channels
   local model = nn.Sequential()
   
   for i, v in ipairs(arch) do
