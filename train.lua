@@ -2,6 +2,7 @@ require 'torch'
 require 'loadcaffe'
 require 'optim'
 require 'image'
+require 'hdf5'
 
 require 'fast_neural_style.DataLoader'
 require 'fast_neural_style.PerceptualCriterion'
@@ -40,10 +41,11 @@ cmd:option('-loss_network', 'models/vgg16.t7')
 
 -- Options for style reconstruction loss
 cmd:option('-style_image', 'images/styles/candy.jpg')
+cmd:option('-style_image_guides', 'path/to/hdf5file')
 cmd:option('-style_image_size', 256)
 cmd:option('-style_weights', '5.0')
 cmd:option('-style_layers', '4,9,16,23')
-cmd:option('-style_target_type', 'gram', 'gram|mean')
+cmd:option('-style_target_type', 'gram', 'gram|mean|guided_gram')
 
 -- Upsampling options
 cmd:option('-upsample_factor', 4)
@@ -68,259 +70,317 @@ cmd:option('-use_cudnn', 1)
 cmd:option('-backend', 'cuda', 'cuda|opencl')
 
 
- function main()
-  local opt = cmd:parse(arg)
+function main()
+    local opt = cmd:parse(arg)
 
-  -- Parse layer strings and weights
-  opt.content_layers, opt.content_weights =
+    -- Parse layer strings and weights
+    opt.content_layers, opt.content_weights =
     utils.parse_layers(opt.content_layers, opt.content_weights)
-  opt.style_layers, opt.style_weights =
+    opt.style_layers, opt.style_weights =
     utils.parse_layers(opt.style_layers, opt.style_weights)
 
-  -- Figure out preprocessing
-  if not preprocess[opt.preprocessing] then
-    local msg = 'invalid -preprocessing "%s"; must be "vgg" or "resnet"'
-    error(string.format(msg, opt.preprocessing))
-  end
-  preprocess = preprocess[opt.preprocessing]
-
-  -- Figure out the backend
-  local dtype, use_cudnn = utils.setup_gpu(opt.gpu, opt.backend, opt.use_cudnn == 1)
-
-  -- Build the model
-  local model = nil
-  if opt.resume_from_checkpoint ~= '' then
-    print('Loading checkpoint from ' .. opt.resume_from_checkpoint)
-    model = torch.load(opt.resume_from_checkpoint).model:type(dtype)
-  else
-    print('Initializing model from scratch')
-    model = models.build_model(opt):type(dtype)
-  end
-  if use_cudnn then cudnn.convert(model, cudnn) end
-  model:training()
-  print(model)
-  
-  -- Set up the pixel loss function
-  local pixel_crit
-  if opt.pixel_loss_weight > 0 then
-    if opt.pixel_loss_type == 'L2' then
-      pixel_crit = nn.MSECriterion():type(dtype)
-    elseif opt.pixel_loss_type == 'L1' then
-      pixel_crit = nn.AbsCriterion():type(dtype)
-    elseif opt.pixel_loss_type == 'SmoothL1' then
-      pixel_crit = nn.SmoothL1Criterion():type(dtype)
+    -- Figure out preprocessing
+    if not preprocess[opt.preprocessing] then
+        local msg = 'invalid -preprocessing "%s"; must be "vgg" or "resnet"'
+        error(string.format(msg, opt.preprocessing))
     end
-  end
+    preprocess = preprocess[opt.preprocessing]
 
-  -- Set up the perceptual loss function
-  local percep_crit
-  if opt.percep_loss_weight > 0 then
-    local loss_net = torch.load(opt.loss_network)
-    local crit_args = {
-      cnn = loss_net,
-      style_layers = opt.style_layers,
-      style_weights = opt.style_weights,
-      content_layers = opt.content_layers,
-      content_weights = opt.content_weights,
-      agg_type = opt.style_target_type,
-    }
-    percep_crit = nn.PerceptualCriterion(crit_args):type(dtype)
+    -- Figure out the backend
+    local dtype, use_cudnn = utils.setup_gpu(opt.gpu, opt.backend, opt.use_cudnn == 1)
 
-    if opt.task == 'style' then
-      -- Load the style image and set it
-      local style_image = image.load(opt.style_image, 3, 'float')
-      style_image = image.scale(style_image, opt.style_image_size)
-      local H, W = style_image:size(2), style_image:size(3)
-      style_image = preprocess.preprocess(style_image:view(1, 3, H, W))
-      percep_crit:setStyleTarget(style_image:type(dtype))
+    -- Load style image guide if necessary
+    local style_image_guides = nil
+    local n_guides = 0
+    if opt.style_target_type == 'guided_gram' then
+        -- Load guides
+        local f = hdf5.open(opt.style_image_guides, 'r')
+        style_image_guides = f:all()['guides']
+        f:close()
+        n_guides = style_image_guides:size(1)
     end
-  end
 
-  local loader = DataLoader(opt)
-  local params, grad_params = model:getParameters()
-
-
-  local function shave_y(x, y, out)
-    if opt.padding_type == 'none' then
-      local H, W = x:size(3), x:size(4)
-      local HH, WW = out:size(3), out:size(4)
-      local xs = (H - HH) / 2
-      local ys = (W - WW) / 2
-      return y[{{}, {}, {xs + 1, H - xs}, {ys + 1, W - ys}}]
+    -- Build the model
+    local model = nil
+    if opt.resume_from_checkpoint ~= '' then
+        print('Loading checkpoint from ' .. opt.resume_from_checkpoint)
+        model = torch.load(opt.resume_from_checkpoint).model:type(dtype)
     else
-      return y
+        print('Initializing model from scratch')
+        model = models.build_model(opt, 3 + n_guides):type(dtype)
     end
-  end
-  
+    if use_cudnn then cudnn.convert(model, cudnn) end
+    model:training()
+    print(model)
 
-  local function f(x)
-    assert(x == params)
-    grad_params:zero()
-    
-    local x, y = loader:getBatch('train')
-    x, y = x:type(dtype), y:type(dtype)
-
-    -- Run model forward
-    local out = model:forward(x)
-    local grad_out = nil
-
-    -- This is a bit of a hack: if we are using reflect-start padding and the
-    -- output is not the same size as the input, lazily add reflection padding
-    -- to the start of the model so the input and output have the same size.
-    if opt.padding_type == 'reflect-start' and x:size(3) ~= out:size(3) then
-      local ph = (x:size(3) - out:size(3)) / 2
-      local pw = (x:size(4) - out:size(4)) / 2
-      local pad_mod = nn.SpatialReflectionPadding(pw, pw, ph, ph):type(dtype)
-      model:insert(pad_mod, 1)
-      out = model:forward(x)
+    -- Set up the pixel loss function
+    local pixel_crit
+    if opt.pixel_loss_weight > 0 then
+        if opt.pixel_loss_type == 'L2' then
+            pixel_crit = nn.MSECriterion():type(dtype)
+        elseif opt.pixel_loss_type == 'L1' then
+            pixel_crit = nn.AbsCriterion():type(dtype)
+        elseif opt.pixel_loss_type == 'SmoothL1' then
+            pixel_crit = nn.SmoothL1Criterion():type(dtype)
+        end
     end
 
-    y = shave_y(x, y, out)
+    -- Set up the perceptual loss function
+    local percep_crit
+    if opt.percep_loss_weight > 0 then
+        local loss_net = torch.load(opt.loss_network)
+        local crit_args = {
+            cnn = loss_net,
+            style_layers = opt.style_layers,
+            style_weights = opt.style_weights,
+            content_layers = opt.content_layers,
+            content_weights = opt.content_weights,
+            agg_type = opt.style_target_type,
+        }
+        percep_crit = nn.PerceptualCriterion(crit_args):type(dtype)
 
-    -- Compute pixel loss and gradient
-    local pixel_loss = 0
-      if pixel_crit then
-      local pixel_loss = pixel_crit:forward(out, y)
-      pixel_loss = pixel_loss * opt.pixel_loss_weight
-      local grad_out_pix = pixel_crit:backward(out, y)
-      if grad_out then
-        grad_out:add(opt.pixel_loss_weight, grad_out_pix)
-      else
-        grad_out_pix:mul(opt.pixel_loss_weight)
-        grad_out = grad_out_pix
-      end
+        if opt.task == 'style' then
+            -- Load the style image and set it
+            local style_image = image.load(opt.style_image, 3, 'float')
+            style_image = image.scale(style_image, opt.style_image_size)
+            local H, W = style_image:size(2), style_image:size(3)
+            style_image = preprocess.preprocess(style_image:view(1, 3, H, W))
+            if opt.style_target_type == 'guided_gram' then
+                style_image_guides = image.scale(style_image_guides, W, H)
+                style_image_guides = image.minmax{tensor=style_image_guides}
+                percep_crit:setStyleTarget({style_image:type(dtype), style_image_guides:view(1, n_guides, H, W):type(dtype)})
+            else
+                percep_crit:setStyleTarget(style_image:type(dtype))
+            end
+        end
     end
 
-    -- Compute perceptual loss and gradient
-    local percep_loss = 0
-    if percep_crit then
-      local target = {content_target=y}
-      percep_loss = percep_crit:forward(out, target)
-      percep_loss = percep_loss * opt.percep_loss_weight
-      local grad_out_percep = percep_crit:backward(out, target)
-      if grad_out then
-        grad_out:add(opt.percep_loss_weight, grad_out_percep)
-      else
-        grad_out_percep:mul(opt.percep_loss_weight)
-        grad_out = grad_out_percep
-      end
+    local loader = DataLoader(opt)
+    local params, grad_params = model:getParameters()
+
+    local function shave_y(x, y, out)
+        if opt.padding_type == 'none' then
+            local H, W = x:size(3), x:size(4)
+            local HH, WW = out:size(3), out:size(4)
+            local xs = (H - HH) / 2
+            local ys = (W - WW) / 2
+            return y[{{}, {}, {xs + 1, H - xs}, {ys + 1, W - ys}}]
+        else
+            return y
+        end
     end
 
-    local loss = pixel_loss + percep_loss
 
-    -- Run model backward
-    model:backward(x, grad_out)
+    local function f(x)
+        assert(x == params)
+        grad_params:zero()
 
-    -- Add regularization
-    -- grad_params:add(opt.weight_decay, params)
- 
-    return loss, grad_params
-  end
-
-
-  local optim_state = {learningRate=opt.learning_rate}
-  local train_loss_history = {}
-  local val_loss_history = {}
-  local val_loss_history_ts = {}
-  local style_loss_history = nil
-  if opt.task == 'style' then
-    style_loss_history = {}
-    for i, k in ipairs(opt.style_layers) do
-      style_loss_history[string.format('style-%d', k)] = {}
-    end
-    for i, k in ipairs(opt.content_layers) do
-      style_loss_history[string.format('content-%d', k)] = {}
-    end
-  end
-
-  local style_weight = opt.style_weight
-  for t = 1, opt.num_iterations do
-    local epoch = t / loader.num_minibatches['train']
-
-    local _, loss = optim.adam(f, params, optim_state)
-
-    table.insert(train_loss_history, loss[1])
-
-    if opt.task == 'style' then
-      for i, k in ipairs(opt.style_layers) do
-        table.insert(style_loss_history[string.format('style-%d', k)],
-          percep_crit.style_losses[i])
-      end
-      for i, k in ipairs(opt.content_layers) do
-        table.insert(style_loss_history[string.format('content-%d', k)],
-          percep_crit.content_losses[i])
-      end
-    end
-
-    print(string.format('Epoch %f, Iteration %d / %d, loss = %f',
-          epoch, t, opt.num_iterations, loss[1]), optim_state.learningRate)
-
-    if t % opt.checkpoint_every == 0 then
-      -- Check loss on the validation set
-      loader:reset('val')
-      model:evaluate()
-      local val_loss = 0
-      print 'Running on validation set ... '
-      local val_batches = opt.num_val_batches
-      for j = 1, val_batches do
-        local x, y = loader:getBatch('val')
+        local x, y = loader:getBatch('train')
         x, y = x:type(dtype), y:type(dtype)
+
+        -- Define fixed mask as training guides
+        local image_guides = nil
+        if opt.style_target_type == 'guided_gram' then
+            local N, H, W = y:size(1), y:size(3), y:size(4)
+            local r = torch.Tensor(2)
+            image_guides = torch.zeros(2,100,100) 
+            image_guides[{{1},{1,50},{}}] = 1
+            image_guides[{{2},{50,100},{}}] = 1
+            image_guides = image.scale(image_guides:double(), W, H):type(dtype)
+            x = torch.cat(x, image_guides:view(1, n_guides, H, W):expand(N, n_guides, H, W), 2)
+            y = {y, image_guides:view(1, n_guides, H, W):expand(N, n_guides, H, W)}
+        end
+        --
+
+        -- Run model forward
         local out = model:forward(x)
+        local grad_out = nil
+
+        -- This is a bit of a hack: if we are using reflect-start padding and the
+        -- output is not the same size as the input, lazily add reflection padding
+        -- to the start of the model so the input and output have the same size.
+        if opt.padding_type == 'reflect-start' and x:size(3) ~= out:size(3) then
+            local ph = (x:size(3) - out:size(3)) / 2
+            local pw = (x:size(4) - out:size(4)) / 2
+            local pad_mod = nn.SpatialReflectionPadding(pw, pw, ph, ph):type(dtype)
+            model:insert(pad_mod, 1)
+            out = model:forward(x)
+        end
+
         y = shave_y(x, y, out)
+
+        if opt.style_target_type == 'guided_gram' then
+            local N, H, W = y[1]:size(1), y[1]:size(3), y[1]:size(4)
+            out = {out, image_guides:view(1, n_guides, H, W):expand(N, n_guides, H, W)}
+        end
+
+        -- Compute pixel loss and gradient
         local pixel_loss = 0
         if pixel_crit then
-          pixel_loss = pixel_crit:forward(out, y)
-          pixel_loss = opt.pixel_loss_weight * pixel_loss
+            local pixel_loss = pixel_crit:forward(out, y)
+            pixel_loss = pixel_loss * opt.pixel_loss_weight
+            local grad_out_pix = pixel_crit:backward(out, y)
+            if grad_out then
+                grad_out:add(opt.pixel_loss_weight, grad_out_pix)
+            else
+                grad_out_pix:mul(opt.pixel_loss_weight)
+                grad_out = grad_out_pix
+            end
         end
+
+        -- Compute perceptual loss and gradient
         local percep_loss = 0
         if percep_crit then
-          percep_loss = percep_crit:forward(out, {content_target=y})
-          percep_loss = opt.percep_loss_weight * percep_loss
+            local target = {content_target=y}
+            percep_loss = percep_crit:forward(out, target)
+            percep_loss = percep_loss * opt.percep_loss_weight
+            local grad_out_percep = nil
+            if opt.style_target_type == 'guided_gram' then
+                grad_out_percep = percep_crit:backward(out, target)[1]
+            else
+                grad_out_percep = percep_crit:backward(out, target)
+            end
+            if grad_out then
+                grad_out:add(opt.percep_loss_weight, grad_out_percep)
+            else
+                grad_out_percep:mul(opt.percep_loss_weight)
+                grad_out = grad_out_percep
+            end
         end
-        val_loss = val_loss + pixel_loss + percep_loss
-      end
-      val_loss = val_loss / val_batches
-      print(string.format('val loss = %f', val_loss))
-      table.insert(val_loss_history, val_loss)
-      table.insert(val_loss_history_ts, t)
-      model:training()
 
-      -- Save a JSON checkpoint
-      local checkpoint = {
-        opt=opt,
-        train_loss_history=train_loss_history,
-        val_loss_history=val_loss_history,
-        val_loss_history_ts=val_loss_history_ts,
-        style_loss_history=style_loss_history,
-      }
-      local filename = string.format('%s.json', opt.checkpoint_name)
-      paths.mkdir(paths.dirname(filename))
-      utils.write_json(filename, checkpoint)
+        local loss = pixel_loss + percep_loss
 
-      -- Save a torch checkpoint; convert the model to float first
-      model:clearState()
-      if use_cudnn then
-        cudnn.convert(model, nn)
-      end
-      model:float()
-      checkpoint.model = model
-      filename = string.format('%s.t7', opt.checkpoint_name)
-      torch.save(filename, checkpoint)
+        -- Run model backward
+        model:backward(x, grad_out)
 
-      -- Convert the model back
-      model:type(dtype)
-      if use_cudnn then
-        cudnn.convert(model, cudnn)
-      end
-      params, grad_params = model:getParameters()
+        -- Add regularization
+        -- grad_params:add(opt.weight_decay, params)
+
+        return loss, grad_params
     end
 
-    if opt.lr_decay_every > 0 and t % opt.lr_decay_every == 0 then
-      local new_lr = opt.lr_decay_factor * optim_state.learningRate
-      optim_state = {learningRate = new_lr}
+
+    local optim_state = {learningRate=opt.learning_rate}
+    local train_loss_history = {}
+    local val_loss_history = {}
+    local val_loss_history_ts = {}
+    local style_loss_history = nil
+    if opt.task == 'style' then
+        style_loss_history = {}
+        for i, k in ipairs(opt.style_layers) do
+            style_loss_history[string.format('style-%d', k)] = {}
+        end
+        for i, k in ipairs(opt.content_layers) do
+            style_loss_history[string.format('content-%d', k)] = {}
+        end
     end
 
-  end
+    local style_weight = opt.style_weight
+    for t = 1, opt.num_iterations do
+        local epoch = t / loader.num_minibatches['train']
+
+        local _, loss = optim.adam(f, params, optim_state)
+
+        table.insert(train_loss_history, loss[1])
+
+        if opt.task == 'style' then
+            for i, k in ipairs(opt.style_layers) do
+                table.insert(style_loss_history[string.format('style-%d', k)],
+                percep_crit.style_losses[i])
+            end
+            for i, k in ipairs(opt.content_layers) do
+                table.insert(style_loss_history[string.format('content-%d', k)],
+                percep_crit.content_losses[i])
+            end
+        end
+
+        print(string.format('Epoch %f, Iteration %d / %d, loss = %f',
+        epoch, t, opt.num_iterations, loss[1]), optim_state.learningRate)
+
+        if t % opt.checkpoint_every == 0 then
+            -- Check loss on the validation set
+            loader:reset('val')
+            model:evaluate()
+            local val_loss = 0
+            print 'Running on validation set ... '
+            local val_batches = opt.num_val_batches
+            for j = 1, val_batches do
+                local x, y = loader:getBatch('val')
+                x, y = x:type(dtype), y:type(dtype)
+
+                -- Same fixed guides for testing 
+                if opt.style_target_type == 'guided_gram' then
+                    local N, H, W = y:size(1), y:size(3), y:size(4)
+                    image_guides = torch.zeros(2,100,100) 
+                    image_guides[{{1},{1,50},{}}] = 1
+                    image_guides[{{2},{50,100},{}}] = 1
+                    image_guides = image.scale(image_guides:double(), W, H):type(dtype)
+                    x = torch.cat(x, image_guides:view(1, n_guides, H, W):expand(N, n_guides, H, W), 2)
+                    y = {y, image_guides:view(1, n_guides, H, W):expand(N, n_guides, H, W)}
+                end
+                
+                local out = model:forward(x)
+                y = shave_y(x, y, out)
+                
+                if opt.style_target_type == 'guided_gram' then
+                    local N, H, W = y[1]:size(1), y[1]:size(3), y[1]:size(4)
+                    out = {out, image_guides:view(1, n_guides, H, W):expand(N, n_guides, H, W)}
+                end
+        
+                local pixel_loss = 0
+                if pixel_crit then
+                    pixel_loss = pixel_crit:forward(out, y)
+                    pixel_loss = opt.pixel_loss_weight * pixel_loss
+                end
+                local percep_loss = 0
+                if percep_crit then
+                    percep_loss = percep_crit:forward(out, {content_target=y})
+                    percep_loss = opt.percep_loss_weight * percep_loss
+                end
+                val_loss = val_loss + pixel_loss + percep_loss
+            end
+            val_loss = val_loss / val_batches
+            print(string.format('val loss = %f', val_loss))
+            table.insert(val_loss_history, val_loss)
+            table.insert(val_loss_history_ts, t)
+            model:training()
+
+            -- Save a JSON checkpoint
+            local checkpoint = {
+                opt=opt,
+                train_loss_history=train_loss_history,
+                val_loss_history=val_loss_history,
+                val_loss_history_ts=val_loss_history_ts,
+                style_loss_history=style_loss_history,
+            }
+            local filename = string.format('%s.json', opt.checkpoint_name)
+            paths.mkdir(paths.dirname(filename))
+            utils.write_json(filename, checkpoint)
+
+            -- Save a torch checkpoint; convert the model to float first
+            model:clearState()
+            if use_cudnn then
+                cudnn.convert(model, nn)
+            end
+            model:float()
+            checkpoint.model = model
+            filename = string.format('%s.t7', opt.checkpoint_name)
+            torch.save(filename, checkpoint)
+
+            -- Convert the model back
+            model:type(dtype)
+            if use_cudnn then
+                cudnn.convert(model, cudnn)
+            end
+            params, grad_params = model:getParameters()
+        end
+
+        if opt.lr_decay_every > 0 and t % opt.lr_decay_every == 0 then
+            local new_lr = opt.lr_decay_factor * optim_state.learningRate
+            optim_state = {learningRate = new_lr}
+        end
+
+    end
 
 end
 
