@@ -1,6 +1,7 @@
 require 'torch'
 require 'nn'
 require 'image'
+require 'hdf5'
 
 require 'fast_neural_style.ShaveImage'
 require 'fast_neural_style.TotalVariation'
@@ -24,6 +25,7 @@ cmd:option('-timing', 0)
 
 -- Input / output options
 cmd:option('-input_image', 'images/content/chicago.jpg')
+cmd:option('-input_image_guides', 'None', 'path/to/hdf5file')
 cmd:option('-output_image', 'out.png')
 cmd:option('-input_dir', '')
 cmd:option('-output_dir', '')
@@ -70,8 +72,25 @@ local function main()
       img = image.scale(img, opt.image_size)
     end
     local H, W = img:size(2), img:size(3)
+    
+    local img_guides = nil
+    local n_guides = 0
+    if opt.input_image_guides ~= 'None' then
+        -- Load guides
+        local f = hdf5.open(opt.input_image_guides, 'r')
+        img_guides = f:all()['guides']
+        f:close()
+        img_guides = image.scale(img_guides, W, H)
+        img_guides = image.minmax{tensor=img_guides}
+        n_guides = img_guides:size(1)
+    end
 
     local img_pre = preprocess.preprocess(img:view(1, 3, H, W)):type(dtype)
+
+    if opt.input_image_guides ~= 'None' then
+        img_pre = torch.cat(img_pre, img_guides:view(1, n_guides, H, W):type(dtype), 2)
+    end
+
     local timer = nil
     if opt.timing == 1 then
       -- Do an extra forward pass to warm up memory and cuDNN
