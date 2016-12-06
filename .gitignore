@@ -6,5 +6,6 @@ data
 *.t7
 images/*
 models/trained/*
+tmp/*
 run_synthesis.sh
 train_fast.sh
