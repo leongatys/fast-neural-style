@@ -1,3 +1,23 @@
+# Controlling fast-neural-style
+The 'leon' branch contains my modifications to Justin Johnson's fast-neural-style code (https://github.com/jcjohnson/fast-neural-style.git) in order to reproduce the control results for Fast Neural Style Transfer (Fig. 6) from the paper "***Controlling Perceptual Factors in Neural Style Transfer***" (https://arxiv.org/abs/1611.07865).
+
+To run the examples you first need to download the pre-trained models:
+
+`sh models/download_leon_models.sh`
+
+Now you should be able to run the RunNetworkExample.ipynb notebook that reproduces the luminance and spatial guidance figure from the paper!
+
+To train the networks yourself you additionally need to download the vgg-16 network (`sh models/download_vgg16.sh `) and make the training data from the MS-COCO dataset by using the script at: `scripts/make_style_dataset.py`. 
+
+For luminance networks you need to make luminance training data by using the --lum flag for above script.
+
+The TrainNetworkExample.ipynb notebook expects the training data at 
+fast-neural-style/data/ms-coco-256.h5 for colour training 
+and at fast-neural-style/data/ms-coco-256-lum.h5 for luminance training.
+
+An easy way to get all prerequisites to run the code is to use our docker container. A description how to use it is given at https://github.com/leongatys/NeuralImageSynthesis/blob/master/README.md#prerequisites .
+
+
 # fast-neural-style
 
 This is the code for the paper
